@@ -11,6 +11,14 @@ const COPYING_FIDS = {}
 const counting = {}
 const router = new Router()
 
+function is_pm2 () {
+  return 'PM2_HOME' in process.env || 'PM2_JSON_PROCESSING' in process.env || 'PM2_CLI' in process.env
+}
+
+function is_int (n) {
+  return n === parseInt(n)
+}
+
 router.get('/api/gdurl/count', async ctx => {
   if (!ROUTER_PASSKEY) return ctx.body = 'gd-utils 成功启动'
   const { query, headers } = ctx.request
@@ -66,12 +74,15 @@ router.post('/api/gdurl/tgbot', async ctx => {
       if (COPYING_FIDS[fid]) return sm({ chat_id, text: `正在处理 ${fid} 的复制命令` })
       COPYING_FIDS[fid] = true
       tg_copy({ fid, target: get_target_by_alias(target), chat_id }).then(task_id => {
-        task_id && sm({ chat_id, text: `开始复制，任务ID: ${task_id} 可输入 /task ${task_id} 查询进度` })
+        is_int(task_id) && sm({ chat_id, text: `开始复制，任务ID: ${task_id} 可输入 /task ${task_id} 查询进度` })
       }).finally(() => COPYING_FIDS[fid] = false)
     } else if (action === 'update') {
       if (counting[fid]) return sm({ chat_id, text: fid + ' 正在统计，请稍等片刻' })
       counting[fid] = true
-      send_count({ fid, chat_id, update: true }).finally(() => {
+      send_count({ fid, chat_id, update: true }).catch(err => {
+        console.error(err)
+        sm({ chat_id, text: fid + ' 统计失败：' + err.message })
+      }).finally(() => {
         delete counting[fid]
       })
     } else if (action === 'clear_button') {
@@ -96,12 +107,15 @@ router.post('/api/gdurl/tgbot', async ctx => {
   }
 
   const fid = extract_fid(text) || extract_from_text(text) || extract_from_text(message_str)
-  const no_fid_commands = ['/task', '/help', '/bm']
+  const no_fid_commands = ['/task', '/help', '/bm', '/reload']
   if (!no_fid_commands.some(cmd => text.startsWith(cmd)) && !validate_fid(fid)) {
     return sm({ chat_id, text: '未识别出分享ID' })
   }
   if (text.startsWith('/help')) return send_help(chat_id)
-  if (text.startsWith('/bm')) {
+  if (text.startsWith('/reload')) {
+    if (!is_pm2()) return sm({ chat_id, text: '进程并非pm2守护，不执行重启' })
+    sm({ chat_id, text: '重启进程' }).then(() => process.exit())
+  } else if (text.startsWith('/bm')) {
     const [cmd, action, alias, target] = text.split(' ').map(v => v.trim()).filter(v => v)
     if (!action) return send_all_bookmarks(chat_id)
     if (action === 'set') {
@@ -133,7 +147,7 @@ router.post('/api/gdurl/tgbot', async ctx => {
     if (target && !validate_fid(target)) return sm({ chat_id, text: `目标ID ${target} 格式不正确` })
     const update = text.endsWith(' -u')
     tg_copy({ fid, target, chat_id, update }).then(task_id => {
-      task_id && sm({ chat_id, text: `开始复制，任务ID: ${task_id} 可输入 /task ${task_id} 查询进度` })
+      is_int(task_id) && sm({ chat_id, text: `开始复制，任务ID: ${task_id} 可输入 /task ${task_id} 查询进度` })
     })
   } else if (text.startsWith('/task')) {
     let task_id = text.replace('/task', '').trim()
