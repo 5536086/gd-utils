@@ -227,6 +227,7 @@ async function send_task_info ({ task_id, chat_id }) {
   if (!message_id || status !== 'copying') return
   const loop = setInterval(async () => {
     const { text, status } = await get_task_info(task_id)
+    // TODO check if text changed
     if (status !== 'copying') clearInterval(loop)
     sm({ chat_id, message_id, text, parse_mode: 'HTML' }, 'editMessageText')
   }, 10 * 1000)
@@ -297,10 +298,33 @@ function reply_cb_query ({ id, data }) {
 }
 
 async function send_count ({ fid, chat_id, update }) {
-  sm({ chat_id, text: `开始获取 ${fid} 所有文件信息，请稍后，建议统计完成前先不要开始复制，因为复制也需要先获取源文件夹信息` })
-  const table = await gen_count_body({ fid, update, type: 'tg', service_account: !USE_PERSONAL_AUTH })
-  if (!table) return sm({ chat_id, parse_mode: 'HTML', text: gen_link(fid) + ' 信息获取失败' })
+  const gen_text = payload => {
+    const { obj_count, processing_count, pending_count } = payload || {}
+    const now = dayjs().format('YYYY-MM-DD HH:mm:ss')
+    return `统计对象：${gen_link(fid)}
+更新时间：${now}
+对象数量：${obj_count || ''}
+${pending_count ? ('排队请求：' + pending_count) : ''}
+${processing_count ? ('进行请求：' + processing_count) : ''}`
+  }
+
   const url = `https://api.telegram.org/bot${tg_token}/sendMessage`
+  let response
+  try {
+    response = await axins.post(url, { chat_id, text: `开始获取 ${fid} 所有文件信息，请稍后，建议统计完成前先不要开始复制，因为复制也需要先获取源文件夹信息` })
+  } catch (e) {}
+  const { data } = response || {}
+  const message_id = data && data.result && data.result.message_id
+  const message_updater = payload => sm({
+    chat_id,
+    message_id,
+    parse_mode: 'HTML',
+    text: gen_text(payload)
+  }, 'editMessageText')
+
+  const service_account = !USE_PERSONAL_AUTH
+  const table = await gen_count_body({ fid, update, service_account, type: 'tg', tg: message_id && message_updater })
+  if (!table) return sm({ chat_id, parse_mode: 'HTML', text: gen_link(fid) + ' 信息获取失败' })
   const gd_link = `https://drive.google.com/drive/folders/${fid}`
   const name = await get_folder_name(fid)
   return axins.post(url, {
@@ -314,19 +338,15 @@ ${table}</pre>`
     // const description = err.response && err.response.data && err.response.data.description
     // const too_long_msgs = ['request entity too large', 'message is too long']
     // if (description && too_long_msgs.some(v => description.toLowerCase().includes(v))) {
-    const smy = await gen_count_body({ fid, type: 'json', service_account: !USE_PERSONAL_AUTH })
-    const { file_count, folder_count, total_size } = JSON.parse(smy)
-    // TODO 显示前n条
+    const limit = 20
+    const table = await gen_count_body({ fid, type: 'tg', service_account: !USE_PERSONAL_AUTH, limit })
     return sm({
       chat_id,
       parse_mode: 'HTML',
-      text: `链接：<a href="https://drive.google.com/drive/folders/${fid}">${fid}</a>\n<pre>
-表格太长超出telegram消息限制，只显示概要：
-目录名称：${name}
-文件总数：${file_count}
-目录总数：${folder_count}
-合计大小：${total_size}
-</pre>`
+      text: `<pre>源文件夹名称：${name}
+源链接：${gd_link}
+表格太长超出telegram消息限制，只显示前${limit}条：
+${table}</pre>`
     })
   })
 }

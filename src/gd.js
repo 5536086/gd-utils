@@ -6,9 +6,11 @@ const pLimit = require('p-limit')
 const axios = require('@viegg/axios')
 const { GoogleToken } = require('gtoken')
 const handle_exit = require('signal-exit')
+const bytes = require('bytes')
 const { argv } = require('yargs')
 
 let { PARALLEL_LIMIT, EXCEED_LIMIT } = require('../config')
+// TODO 根据过去一段时间内的请求成功数和失败数动态调整并行请求数
 PARALLEL_LIMIT = argv.l || argv.limit || PARALLEL_LIMIT
 EXCEED_LIMIT = EXCEED_LIMIT || 7
 
@@ -70,8 +72,14 @@ function get_sa_batch () {
   })
 }
 
-handle_exit(() => {
-  // console.log('handle_exit running')
+handle_exit((code, signal) => {
+  // console.log(code, signal)
+  // ctrl+c: null SIGINT
+  // pm2 reload: null SIGINT
+  // tg bot /reload: 0 null
+  // normal exit: 0 null
+  if (code === 0 && !is_pm2()) return // normal exit in command line, do nothing
+  // TODO: record running task ID for each thread
   const records = db.prepare('select id from task where status=?').all('copying')
   records.forEach(v => {
     db.prepare('update task set status=? where id=?').run('interrupt', v.id)
@@ -80,9 +88,34 @@ handle_exit(() => {
   db.close()
 })
 
-async function gen_count_body ({ fid, type, update, service_account }) {
+async function save_md5 ({fid, size, not_teamdrive, update, service_account}) {
+  let files = await walk_and_save({ fid, not_teamdrive, update, service_account })
+  files = files.filter(v => v.mimeType !== FOLDER_TYPE)
+  if (typeof size !== 'number') size = bytes.parse(size)
+  if (size) files = files.filter(v => v.size >= size)
+  let cnt = 0
+  files.forEach(file => {
+    const {md5Checksum, id} = file
+    if (!md5Checksum) return
+    const record = db.prepare('SELECT * FROM hash WHERE gid = ?').get(id)
+    if (record) return
+    db.prepare('INSERT INTO hash (gid, md5) VALUES (?, ?)')
+      .run(id, md5Checksum)
+    cnt++
+  })
+  console.log('已新增', cnt, '条md5记录')
+}
+
+function get_gid_by_md5 (md5) {
+  const records = db.prepare('select * from hash where md5=? and status=?').all(md5, 'normal')
+  if (!records.length) return null
+  // console.log('got existed md5 record in db:', md5)
+  return get_random_element(records).gid
+}
+
+async function gen_count_body ({ fid, type, update, service_account, limit, tg }) {
   async function update_info () {
-    const info = await walk_and_save({ fid, update, service_account })
+    const info = await walk_and_save({ fid, update, service_account, tg })
     return [info, summary(info)]
   }
 
@@ -95,7 +128,7 @@ async function gen_count_body ({ fid, type, update, service_account }) {
         curl: make_table,
         tg: make_tg_table
       }
-      let result = type_func[type](smy)
+      let result = type_func[type](smy, limit)
       if (unfinished_number) result += `\n未统计完成目录数量：${unfinished_number}`
       return result
     } else { // 默认输出json
@@ -218,7 +251,7 @@ function get_all_by_fid (fid) {
   }
 }
 
-async function walk_and_save ({ fid, not_teamdrive, update, service_account, with_modifiedTime }) {
+async function walk_and_save ({ fid, not_teamdrive, update, service_account, with_modifiedTime, tg }) {
   let result = []
   const unfinished_folders = []
   const limit = pLimit(PARALLEL_LIMIT)
@@ -233,6 +266,14 @@ async function walk_and_save ({ fid, not_teamdrive, update, service_account, wit
     const message = `${now} | 已获取对象 ${result.length} | 网络请求 进行中${limit.activeCount}/排队中${limit.pendingCount}`
     print_progress(message)
   }, 1000)
+
+  const tg_loop = tg && setInterval(() => {
+    tg({
+      obj_count: result.length,
+      processing_count: limit.activeCount,
+      pending_count: limit.pendingCount
+    })
+  }, 10 * 1000)
 
   async function recur (parent) {
     let files, should_save
@@ -264,6 +305,14 @@ async function walk_and_save ({ fid, not_teamdrive, update, service_account, wit
   console.log('\n信息获取完毕')
   unfinished_folders.length ? console.log('未读取完毕的目录ID：', JSON.stringify(unfinished_folders)) : console.log('所有目录读取完毕')
   clearInterval(loop)
+  if (tg_loop) {
+    clearInterval(tg_loop)
+    tg({
+      obj_count: result.length,
+      processing_count: limit.activeCount,
+      pending_count: limit.pendingCount
+    })
+  }
   const smy = unfinished_folders.length ? null : summary(result)
   smy && db.prepare('UPDATE gd SET summary=?, mtime=? WHERE fid=?').run(JSON.stringify(smy), Date.now(), fid)
   result.unfinished_number = unfinished_folders.length
@@ -485,6 +534,7 @@ async function copy ({ source, target, name, min_size, update, not_teamdrive, se
   const file = await get_info_by_id(source, service_account)
   if (!file) return console.error(`无法获取对象信息，请检查链接是否有效且SA拥有相应的权限：https://drive.google.com/drive/folders/${source}`)
   if (file && file.mimeType !== FOLDER_TYPE) {
+    if (argv.hash_server === 'local') source = get_gid_by_md5(file.md5Checksum)
     return copy_file(source, target, service_account).catch(console.error)
   }
 
@@ -622,12 +672,14 @@ async function copy_files ({ files, mapping, service_account, root, task_id }) {
       continue
     }
     concurrency++
-    const { id, parent } = file
+    let { id, parent, md5Checksum } = file
+    if (argv.hash_server === 'local') id = get_gid_by_md5(md5Checksum) || id
     const target = mapping[parent] || root
-    copy_file(id, target, service_account, null, task_id).then(new_file => {
+    const use_sa = (id !== file.id) ? true : service_account // 如果在本地数据库中找到了相同md5的记录，则使用sa拷贝
+    copy_file(id, target, use_sa, null, task_id).then(new_file => {
       if (new_file) {
         count++
-        db.prepare('INSERT INTO copied (taskid, fileid) VALUES (?, ?)').run(task_id, id)
+        db.prepare('INSERT INTO copied (taskid, fileid) VALUES (?, ?)').run(task_id, file.id)
       }
     }).catch(e => {
       err = e
@@ -689,21 +741,21 @@ async function copy_file (id, parent, use_sa, limit, task_id) {
       if (!use_sa && message && message.toLowerCase().includes('rate limit')) {
         throw new Error('个人帐号触发限制：' + message)
       }
-      if (use_sa && message && message.toLowerCase().includes('rate limit')) {
-        retry--
-        if (gtoken.exceed_count >= EXCEED_LIMIT) {
-          SA_TOKENS = SA_TOKENS.filter(v => v.gtoken !== gtoken)
-          if (!SA_TOKENS.length) SA_TOKENS = get_sa_batch()
-          console.log(`此帐号连续${EXCEED_LIMIT}次触发使用限额，本批次剩余可用SA数量：`, SA_TOKENS.length)
-        } else {
-          // console.log('此帐号触发使用限额，已标记，若下次请求正常则解除标记，否则剔除此SA')
-          if (gtoken.exceed_count) {
-            gtoken.exceed_count++
-          } else {
-            gtoken.exceed_count = 1
-          }
-        }
-      }
+      // if (use_sa && message && message.toLowerCase().includes('user rate limit')) {
+      //   if (retry >= RETRY_LIMIT) throw new Error(`此资源连续${EXCEED_LIMIT}次触发userRateLimitExceeded错误，停止复制`)
+      //   if (gtoken.exceed_count >= EXCEED_LIMIT) {
+      //     SA_TOKENS = SA_TOKENS.filter(v => v.gtoken !== gtoken)
+      //     if (!SA_TOKENS.length) SA_TOKENS = get_sa_batch()
+      //     console.log(`此帐号连续${EXCEED_LIMIT}次触发使用限额，本批次剩余可用SA数量：`, SA_TOKENS.length)
+      //   } else {
+      //     console.log('此帐号触发使用限额，已标记，若下次请求正常则解除标记，否则剔除此SA')
+      //     if (gtoken.exceed_count) {
+      //       gtoken.exceed_count++
+      //     } else {
+      //       gtoken.exceed_count = 1
+      //     }
+      //   }
+      // }
     }
   }
   if (use_sa && !SA_TOKENS.length) {
@@ -785,9 +837,10 @@ function find_dupe (arr) {
     return !has_child
   })
   for (const file of files) {
-    const { md5Checksum, parent, name } = file
+    const { md5Checksum, parent, name, size } = file
     // 根据文件位置和md5值来判断是否重复
-    const key = parent + '|' + md5Checksum // + '|' + name
+    const key = parent + '|' + md5Checksum
+    // const key = md5Checksum + '|' + size
     if (exists[key]) {
       dupe_files.push(file)
     } else {
@@ -910,4 +963,4 @@ function print_progress (msg) {
   }
 }
 
-module.exports = { ls_folder, count, validate_fid, copy, dedupe, copy_file, gen_count_body, real_copy, get_name_by_id, get_info_by_id, get_access_token, get_sa_token, walk_and_save }
+module.exports = { ls_folder, count, validate_fid, copy, dedupe, copy_file, gen_count_body, real_copy, get_name_by_id, get_info_by_id, get_access_token, get_sa_token, walk_and_save, save_md5 }
